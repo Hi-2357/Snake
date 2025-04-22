@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Multi-AI Snake Trainer</title>
+  <style>
+    body {
+      background: #111;
+      color: white;
+      text-align: center;
+      font-family: sans-serif;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, 160px);
+      justify-content: center;
+      gap: 5px;
+    }
+    canvas {
+      background: black;
+    }
+  </style>
+</head>
+<body>
+  <h2>Training 50 AI Snakes...</h2>
+  <canvas id="chartCanvas" width="800" height="200" style="cursor: zoom-in;"></canvas>
+  <label for="speedRange">Speed:</label>
+  <input type="range" id="speedRange" min="1" max="200" value="20">
+  <span id="speedValue">5</span> ms
+  <br>
+  <button id="pauseBtn">Pause</button>
+  <label><input type="checkbox" id="fastMode"> Fast Mode</label>
+  <div class="grid" id="grid"></div>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.10.0/dist/tf.min.js"></script>
+  <script>
+    const GRID_SIZE = 8;
+    const BOX = 20;
+    const CANVAS_SIZE = GRID_SIZE * BOX;
+    const AGENT_COUNT = 50;
+    const ACTIONS = ['UP', 'DOWN', 'LEFT', 'RIGHT'];
+
+    let epsilon = 1.0, epsilonDecay = 0.98, minEpsilon = 0.05;
+    let gamma = 0.9;
+
+    const model = tf.sequential();
+    model.add(tf.layers.dense({ inputShape: [6], units: 32, activation: 'relu' }));
+    model.add(tf.layers.dense({ units: 32, activation: 'relu' }));
+    model.add(tf.layers.dense({ units: 4 }));
+    model.compile({ optimizer: 'adam', loss: 'meanSquaredError' });
+
+    const replayBuffer = [];
+    const maxBufferSize = 10000;
+
+    function stateToTensor(stateStr) {
+      return tf.tensor2d([stateStr.split(',').map(Number)]);
+    }
+
+    async function trainModel() {
+      if (replayBuffer.length < 100) return;
+      const batch = replayBuffer.sort(() => 0.5 - Math.random()).slice(0, 64);
+
+      const states = batch.map(t => t.state.split(',').map(Number));
+      const nextStates = batch.map(t => t.nextState.split(',').map(Number));
+      const stateTensor = tf.tensor2d(states);
+      const nextTensor = tf.tensor2d(nextStates);
+      const targets = await model.predict(stateTensor).array();
+      const nextQs = await model.predict(nextTensor).array();
+
+      batch.forEach((t, i) => {
+        const maxNext = Math.max(...nextQs[i]);
+        targets[i][t.action] = t.reward + gamma * maxNext;
+      });
+
+      const y = tf.tensor2d(targets);
+      await model.fit(stateTensor, y, { epochs: 1, batchSize: 32, verbose: 0 });
+      tf.dispose([stateTensor, nextTensor, y]);
+    }
+
+    class Agent {
+      constructor(canvas) {
+        this.ctx = canvas.getContext('2d');
+        this.reset();
+      }
+
+      reset() {
+        this.snake = [{ x: 4, y: 4 }];
+        this.food = this.spawnFood();
+        this.direction = ACTIONS[Math.floor(Math.random() * 4)];
+        this.done = false;
+        this.score = 0;
+      }
+
+      spawnFood() {
+        let pos;
+        do {
+          pos = {
+            x: Math.floor(Math.random() * GRID_SIZE),
+            y: Math.floor(Math.random() * GRID_SIZE)
+          };
+        } while (this.snake.some(s => s.x === pos.x && s.y === pos.y));
+        return pos;
+      }
+
+      getState() {
+        const head = this.snake[0];
+        const dx = Math.sign(this.food.x - head.x);
+        const dy = Math.sign(this.food.y - head.y);
+        const danger = [0, 0, 0, 0];
+        const dirs = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+        dirs.forEach(([dx, dy], i) => {
+          const nx = head.x + dx;
+          const ny = head.y + dy;
+          if (
+            nx < 0 || nx >= GRID_SIZE || ny < 0 || ny >= GRID_SIZE ||
+            this.snake.some(s => s.x === nx && s.y === ny)
+          ) danger[i] = 1;
+        });
+        return `${dx},${dy},${danger.join(',')}`;
+      }
+
+      chooseAction(state) {
+        if (Math.random() < epsilon) {
+          return Math.floor(Math.random() * 4);
+        }
+        const input = stateToTensor(state);
+        const qVals = model.predict(input);
+        const action = qVals.argMax(1).dataSync()[0];
+        tf.dispose([input, qVals]);
+        return action;
+      }
+
+      step(actionIdx) {
+        const dir = ACTIONS[actionIdx];
+        const head = { ...this.snake[0] };
+        if (dir === 'UP') head.y--;
+        if (dir === 'DOWN') head.y++;
+        if (dir === 'LEFT') head.x--;
+        if (dir === 'RIGHT') head.x++;
+
+        if (
+          head.x < 0 || head.x >= GRID_SIZE || head.y < 0 || head.y >= GRID_SIZE ||
+          this.snake.some(s => s.x === head.x && s.y === head.y)
+        ) {
+          this.done = true;
+          return -10;
+        }
+
+        this.snake.unshift(head);
+        let reward = -0.1;
+
+        if (head.x === this.food.x && head.y === this.food.y) {
+          reward = 10;
+          this.food = this.spawnFood();
+          this.score++;
+        } else {
+          this.snake.pop();
+        }
+
+        return reward;
+      }
+
+      updateQ(prevState, action, reward, nextState) {
+        replayBuffer.push({ state: prevState, action, reward, nextState });
+        if (replayBuffer.length > maxBufferSize) replayBuffer.shift();
+      }
+
+      draw() {
+        this.ctx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        this.snake.forEach((s, i) => {
+          this.ctx.fillStyle = i === 0 ? 'lime' : 'green';
+          this.ctx.fillRect(s.x * BOX, s.y * BOX, BOX, BOX);
+        });
+        this.ctx.fillStyle = 'red';
+        this.ctx.fillRect(this.food.x * BOX, this.food.y * BOX, BOX, BOX);
+      }
+    }
+
+    const grid = document.getElementById('grid');
+    const agents = [];
+
+    for (let i = 0; i < AGENT_COUNT; i++) {
+      const canvas = document.createElement('canvas');
+      canvas.width = CANVAS_SIZE;
+      canvas.height = CANVAS_SIZE;
+      grid.appendChild(canvas);
+      agents.push(new Agent(canvas));
+    }
+
+    function trainAll() {
+      agents.forEach(agent => {
+        if (agent.done) agent.reset();
+
+        const state = agent.getState();
+        const action = agent.chooseAction(state);
+        const reward = agent.step(action);
+        const nextState = agent.getState();
+        agent.updateQ(state, action, reward, nextState);
+        agent.draw();
+      });
+      epsilon = Math.max(minEpsilon, epsilon * epsilonDecay);
+    }
+
+    let interval = 1;
+    let intervalId;
+    let isPaused = false;
+    function startTraining() {
+      intervalId = setInterval(() => {
+        const fast = document.getElementById('fastMode')?.checked;
+        const stepsPerTick = fast ? 1 : 1;
+        if (!isPaused) {
+          for (let i = 0; i < stepsPerTick; i++) trainAll();
+          trainModel();
+          document.querySelector('h2').textContent = `Training 50 snakes faster... Epsilon: ${epsilon.toFixed(2)} | Buffer Size: ${replayBuffer.length}`;
+        }
+      }, interval);
+    }
+    startTraining();
+
+    document.getElementById('speedRange').addEventListener('input', (e) => {
+      clearInterval(intervalId);
+      interval = parseInt(e.target.value);
+      document.getElementById('speedValue').textContent = interval;
+      startTraining();
+    });
+
+    document.getElementById('pauseBtn').addEventListener('click', () => {
+      isPaused = !isPaused;
+      document.getElementById('pauseBtn').textContent = isPaused ? 'Resume' : 'Pause';
+    });
+
+    const chartCanvas = document.getElementById('chartCanvas');
+    const chartCtx = chartCanvas.getContext('2d');
+    const maxDataPoints = 200;
+    let scoresHistory = [];
+    let qSizeHistory = [];
+
+    function updateChart() {
+      scoresHistory.push(agents.reduce((sum, a) => sum + a.score, 0) / agents.length);
+      qSizeHistory.push(replayBuffer.length);
+      if (scoresHistory.length > maxDataPoints) {
+        scoresHistory.shift();
+        qSizeHistory.shift();
+      }
+
+      chartCtx.clearRect(0, 0, chartCanvas.width, chartCanvas.height);
+
+      chartCtx.beginPath();
+      chartCtx.strokeStyle = 'lime';
+      scoresHistory.forEach((v, i) => {
+        const x = (i / maxDataPoints) * chartCanvas.width;
+        const y = chartCanvas.height - v * 5;
+        if (i === 0) chartCtx.moveTo(x, y);
+        else chartCtx.lineTo(x, y);
+      });
+      chartCtx.stroke();
+
+      chartCtx.beginPath();
+      chartCtx.strokeStyle = 'cyan';
+      qSizeHistory.forEach((v, i) => {
+        const x = (i / maxDataPoints) * chartCanvas.width;
+        const y = chartCanvas.height - (v / 10);
+        if (i === 0) chartCtx.moveTo(x, y);
+        else chartCtx.lineTo(x, y);
+      });
+      chartCtx.stroke();
+    }
+
+    setInterval(updateChart, 200);
+
+    let zoomed = false;
+    chartCanvas.addEventListener('click', () => {
+      zoomed = !zoomed;
+      if (zoomed) {
+        chartCanvas.style.transform = 'scale(2)';
+        chartCanvas.style.transformOrigin = 'top left';
+        chartCanvas.style.cursor = 'zoom-out';
+      } else {
+        chartCanvas.style.transform = 'scale(1)';
+        chartCanvas.style.cursor = 'zoom-in';
+      }
+    });
+  </script>
+</body>
+</html>
